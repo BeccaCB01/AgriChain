@@ -126,3 +126,302 @@
     (ok new-rate)
   )
 )
+
+;; ===========================================
+;; PUBLIC FUNCTIONS - FARMER MANAGEMENT
+;; ===========================================
+
+;; Register a new farmer
+(define-public (register-farmer (name (string-ascii 50)) (location (string-ascii 100)) (phone (string-ascii 20)))
+  (let
+    (
+      (farmer-id (var-get next-farmer-id))
+      (existing-farmer (get-farmer-by-principal tx-sender))
+    )
+    (begin
+      ;; Check contract is active
+      (asserts! (is-contract-active) ERR_UNAUTHORIZED)
+      ;; Check farmer doesn't already exist
+      (asserts! (is-none existing-farmer) ERR_ALREADY_EXISTS)
+      ;; Validate inputs
+      (asserts! (> (len name) u0) ERR_INVALID_AMOUNT)
+      (asserts! (> (len location) u0) ERR_INVALID_AMOUNT)
+
+      ;; Create farmer record
+      (map-set farmers farmer-id {
+        owner: tx-sender,
+        name: name,
+        location: location,
+        phone: phone,
+        verified: false,
+        reputation-score: u100, ;; Start with base score
+        total-crops-sold: u0,
+        registration-block: block-height
+      })
+
+      ;; Create principal lookup
+      (map-set farmer-principals tx-sender farmer-id)
+
+      ;; Update counters
+      (var-set next-farmer-id (+ farmer-id u1))
+      (var-set total-farmers (+ (var-get total-farmers) u1))
+
+      (ok farmer-id)
+    )
+  )
+)
+
+;; Update farmer information
+(define-public (update-farmer-info (name (string-ascii 50)) (location (string-ascii 100)) (phone (string-ascii 20)))
+  (let
+    (
+      (farmer-id-opt (get-farmer-by-principal tx-sender))
+    )
+    (begin
+      (asserts! (is-contract-active) ERR_UNAUTHORIZED)
+      (asserts! (is-some farmer-id-opt) ERR_NOT_FOUND)
+
+      (let
+        (
+          (farmer-id (unwrap-panic farmer-id-opt))
+          (current-farmer (unwrap-panic (map-get? farmers farmer-id)))
+        )
+        (begin
+          ;; Validate inputs
+          (asserts! (> (len name) u0) ERR_INVALID_AMOUNT)
+          (asserts! (> (len location) u0) ERR_INVALID_AMOUNT)
+
+          ;; Update farmer record
+          (map-set farmers farmer-id (merge current-farmer {
+            name: name,
+            location: location,
+            phone: phone
+          }))
+
+          (ok farmer-id)
+        )
+      )
+    )
+  )
+)
+
+;; Verify farmer (admin only)
+(define-public (verify-farmer (farmer-id uint))
+  (let
+    (
+      (farmer-opt (map-get? farmers farmer-id))
+    )
+    (begin
+      (asserts! (is-contract-owner) ERR_UNAUTHORIZED)
+      (asserts! (is-some farmer-opt) ERR_NOT_FOUND)
+
+      (let
+        (
+          (farmer (unwrap-panic farmer-opt))
+        )
+        (begin
+          (map-set farmers farmer-id (merge farmer { verified: true }))
+          (ok true)
+        )
+      )
+    )
+  )
+)
+
+;; ===========================================
+;; PUBLIC FUNCTIONS - CROP MANAGEMENT
+;; ===========================================
+
+;; List a new crop for sale
+(define-public (list-crop
+  (name (string-ascii 50))
+  (variety (string-ascii 50))
+  (quantity uint)
+  (price-per-kg uint)
+  (harvest-date uint)
+  (expiry-date uint)
+  (description (string-ascii 200))
+  (location (string-ascii 100))
+)
+  (let
+    (
+      (crop-id (var-get next-crop-id))
+      (farmer-id-opt (get-farmer-by-principal tx-sender))
+    )
+    (begin
+      ;; Check contract is active
+      (asserts! (is-contract-active) ERR_UNAUTHORIZED)
+      ;; Check farmer is registered
+      (asserts! (is-some farmer-id-opt) ERR_INVALID_FARMER)
+      ;; Validate inputs
+      (asserts! (> (len name) u0) ERR_INVALID_AMOUNT)
+      (asserts! (> quantity u0) ERR_INVALID_AMOUNT)
+      (asserts! (> price-per-kg u0) ERR_INVALID_PRICE)
+      (asserts! (> expiry-date harvest-date) ERR_INVALID_AMOUNT)
+      (asserts! (> expiry-date block-height) ERR_INVALID_AMOUNT)
+
+      (let
+        (
+          (farmer-id (unwrap-panic farmer-id-opt))
+        )
+        (begin
+          ;; Create crop record
+          (map-set crops crop-id {
+            farmer-id: farmer-id,
+            name: name,
+            variety: variety,
+            quantity: quantity,
+            price-per-kg: price-per-kg,
+            harvest-date: harvest-date,
+            expiry-date: expiry-date,
+            status: CROP_STATUS_AVAILABLE,
+            description: description,
+            location: location
+          })
+
+          ;; Update counters
+          (var-set next-crop-id (+ crop-id u1))
+          (var-set total-crops (+ (var-get total-crops) u1))
+
+          (ok crop-id)
+        )
+      )
+    )
+  )
+)
+
+;; Update crop information (farmer only)
+(define-public (update-crop
+  (crop-id uint)
+  (quantity uint)
+  (price-per-kg uint)
+  (expiry-date uint)
+  (description (string-ascii 200))
+)
+  (let
+    (
+      (crop-opt (map-get? crops crop-id))
+      (farmer-id-opt (get-farmer-by-principal tx-sender))
+    )
+    (begin
+      (asserts! (is-contract-active) ERR_UNAUTHORIZED)
+      (asserts! (is-some crop-opt) ERR_NOT_FOUND)
+      (asserts! (is-some farmer-id-opt) ERR_INVALID_FARMER)
+
+      (let
+        (
+          (crop (unwrap-panic crop-opt))
+          (farmer-id (unwrap-panic farmer-id-opt))
+        )
+        (begin
+          ;; Check farmer owns this crop
+          (asserts! (is-eq (get farmer-id crop) farmer-id) ERR_UNAUTHORIZED)
+          ;; Check crop is still available
+          (asserts! (is-eq (get status crop) CROP_STATUS_AVAILABLE) ERR_CROP_NOT_AVAILABLE)
+          ;; Validate inputs
+          (asserts! (> quantity u0) ERR_INVALID_AMOUNT)
+          (asserts! (> price-per-kg u0) ERR_INVALID_PRICE)
+          (asserts! (> expiry-date block-height) ERR_INVALID_AMOUNT)
+
+          ;; Update crop record
+          (map-set crops crop-id (merge crop {
+            quantity: quantity,
+            price-per-kg: price-per-kg,
+            expiry-date: expiry-date,
+            description: description
+          }))
+
+          (ok crop-id)
+        )
+      )
+    )
+  )
+)
+
+;; Remove crop listing (farmer only)
+(define-public (remove-crop (crop-id uint))
+  (let
+    (
+      (crop-opt (map-get? crops crop-id))
+      (farmer-id-opt (get-farmer-by-principal tx-sender))
+    )
+    (begin
+      (asserts! (is-contract-active) ERR_UNAUTHORIZED)
+      (asserts! (is-some crop-opt) ERR_NOT_FOUND)
+      (asserts! (is-some farmer-id-opt) ERR_INVALID_FARMER)
+
+      (let
+        (
+          (crop (unwrap-panic crop-opt))
+          (farmer-id (unwrap-panic farmer-id-opt))
+        )
+        (begin
+          ;; Check farmer owns this crop
+          (asserts! (is-eq (get farmer-id crop) farmer-id) ERR_UNAUTHORIZED)
+          ;; Check crop is still available
+          (asserts! (is-eq (get status crop) CROP_STATUS_AVAILABLE) ERR_CROP_NOT_AVAILABLE)
+
+          ;; Update crop status to sold (removing from market)
+          (map-set crops crop-id (merge crop { status: CROP_STATUS_SOLD }))
+
+          (ok crop-id)
+        )
+      )
+    )
+  )
+)
+
+;; ===========================================
+;; READ-ONLY FUNCTIONS
+;; ===========================================
+
+;; Get farmer information
+(define-read-only (get-farmer (farmer-id uint))
+  (map-get? farmers farmer-id)
+)
+
+;; Get farmer by principal
+(define-read-only (get-farmer-id (farmer-principal principal))
+  (map-get? farmer-principals farmer-principal)
+)
+
+;; Get crop information
+(define-read-only (get-crop (crop-id uint))
+  (map-get? crops crop-id)
+)
+
+;; Get contract statistics
+(define-read-only (get-contract-stats)
+  {
+    total-farmers: (var-get total-farmers),
+    total-crops: (var-get total-crops),
+    platform-fee-rate: (var-get platform-fee-rate),
+    contract-active: (var-get contract-active),
+    next-farmer-id: (var-get next-farmer-id),
+    next-crop-id: (var-get next-crop-id)
+  }
+)
+
+;; Check if farmer is verified
+(define-read-only (is-farmer-verified (farmer-id uint))
+  (match (map-get? farmers farmer-id)
+    farmer (get verified farmer)
+    false
+  )
+)
+
+;; Get farmer's reputation score
+(define-read-only (get-farmer-reputation (farmer-id uint))
+  (match (map-get? farmers farmer-id)
+    farmer (get reputation-score farmer)
+    u0
+  )
+)
+
+;; Calculate total crop value
+(define-read-only (get-crop-total-value (crop-id uint))
+  (match (map-get? crops crop-id)
+    crop (* (get quantity crop) (get price-per-kg crop))
+    u0
+  )
+)
