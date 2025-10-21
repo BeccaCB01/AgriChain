@@ -425,3 +425,346 @@
     u0
   )
 )
+;; ===========================================
+;; ADDITIONAL DATA MAPS FOR TRADING
+;; ===========================================
+
+;; Purchase orders
+(define-map purchase-orders
+  uint ;; order-id
+  {
+    buyer: principal,
+    crop-id: uint,
+    quantity: uint,
+    total-price: uint,
+    status: uint, ;; 1=pending, 2=confirmed, 3=completed, 4=cancelled
+    created-at: uint,
+    escrow-amount: uint
+  }
+)
+
+;; Order counter
+(define-data-var next-order-id uint u1)
+
+;; Order status constants
+(define-constant ORDER_STATUS_PENDING u1)
+(define-constant ORDER_STATUS_CONFIRMED u2)
+(define-constant ORDER_STATUS_COMPLETED u3)
+(define-constant ORDER_STATUS_CANCELLED u4)
+
+;; Escrow balances
+(define-map escrow-balances
+  principal ;; buyer
+  uint      ;; amount in microSTX
+)
+
+;; ===========================================
+;; PUBLIC FUNCTIONS - MARKETPLACE TRADING
+;; ===========================================
+
+;; Create a purchase order
+(define-public (create-purchase-order (crop-id uint) (quantity uint))
+  (let
+    (
+      (crop-opt (map-get? crops crop-id))
+      (order-id (var-get next-order-id))
+    )
+    (begin
+      (asserts! (is-contract-active) ERR_UNAUTHORIZED)
+      (asserts! (is-some crop-opt) ERR_NOT_FOUND)
+      (asserts! (> quantity u0) ERR_INVALID_AMOUNT)
+
+      (let
+        (
+          (crop (unwrap-panic crop-opt))
+          (farmer-opt (map-get? farmers (get farmer-id crop)))
+        )
+        (begin
+          ;; Check crop is available
+          (asserts! (is-eq (get status crop) CROP_STATUS_AVAILABLE) ERR_CROP_NOT_AVAILABLE)
+          ;; Check quantity is available
+          (asserts! (<= quantity (get quantity crop)) ERR_INVALID_AMOUNT)
+          ;; Check buyer is not the farmer
+          (asserts! (not (is-eq tx-sender (get owner (unwrap-panic farmer-opt)))) ERR_UNAUTHORIZED)
+          ;; Check crop hasn't expired
+          (asserts! (> (get expiry-date crop) block-height) ERR_CROP_NOT_AVAILABLE)
+
+          (let
+            (
+              (total-price (* quantity (get price-per-kg crop)))
+              (platform-fee (/ (* total-price (var-get platform-fee-rate)) u10000))
+              (escrow-amount (+ total-price platform-fee))
+            )
+            (begin
+              ;; Transfer STX to escrow
+              (try! (stx-transfer? escrow-amount tx-sender (as-contract tx-sender)))
+
+              ;; Update escrow balance
+              (map-set escrow-balances tx-sender
+                (+ (default-to u0 (map-get? escrow-balances tx-sender)) escrow-amount))
+
+              ;; Create purchase order
+              (map-set purchase-orders order-id {
+                buyer: tx-sender,
+                crop-id: crop-id,
+                quantity: quantity,
+                total-price: total-price,
+                status: ORDER_STATUS_PENDING,
+                created-at: block-height,
+                escrow-amount: escrow-amount
+              })
+
+              ;; Update order counter
+              (var-set next-order-id (+ order-id u1))
+
+              (ok order-id)
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+;; Confirm purchase order (farmer only)
+(define-public (confirm-purchase-order (order-id uint))
+  (let
+    (
+      (order-opt (map-get? purchase-orders order-id))
+      (farmer-id-opt (get-farmer-by-principal tx-sender))
+    )
+    (begin
+      (asserts! (is-contract-active) ERR_UNAUTHORIZED)
+      (asserts! (is-some order-opt) ERR_NOT_FOUND)
+      (asserts! (is-some farmer-id-opt) ERR_INVALID_FARMER)
+
+      (let
+        (
+          (order (unwrap-panic order-opt))
+          (farmer-id (unwrap-panic farmer-id-opt))
+          (crop-opt (map-get? crops (get crop-id order)))
+        )
+        (begin
+          (asserts! (is-some crop-opt) ERR_NOT_FOUND)
+
+          (let
+            (
+              (crop (unwrap-panic crop-opt))
+            )
+            (begin
+              ;; Check farmer owns the crop
+              (asserts! (is-eq (get farmer-id crop) farmer-id) ERR_UNAUTHORIZED)
+              ;; Check order is pending
+              (asserts! (is-eq (get status order) ORDER_STATUS_PENDING) ERR_INVALID_AMOUNT)
+              ;; Check crop is still available
+              (asserts! (is-eq (get status crop) CROP_STATUS_AVAILABLE) ERR_CROP_NOT_AVAILABLE)
+
+              ;; Update order status
+              (map-set purchase-orders order-id (merge order { status: ORDER_STATUS_CONFIRMED }))
+
+              ;; Reserve the crop
+              (map-set crops (get crop-id order) (merge crop { status: CROP_STATUS_RESERVED }))
+
+              (ok order-id)
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+;; Complete purchase order (buyer only - after receiving goods)
+(define-public (complete-purchase-order (order-id uint))
+  (let
+    (
+      (order-opt (map-get? purchase-orders order-id))
+    )
+    (begin
+      (asserts! (is-contract-active) ERR_UNAUTHORIZED)
+      (asserts! (is-some order-opt) ERR_NOT_FOUND)
+
+      (let
+        (
+          (order (unwrap-panic order-opt))
+          (crop-opt (map-get? crops (get crop-id order)))
+        )
+        (begin
+          (asserts! (is-some crop-opt) ERR_NOT_FOUND)
+          ;; Check buyer is calling
+          (asserts! (is-eq tx-sender (get buyer order)) ERR_UNAUTHORIZED)
+          ;; Check order is confirmed
+          (asserts! (is-eq (get status order) ORDER_STATUS_CONFIRMED) ERR_INVALID_AMOUNT)
+
+          (let
+            (
+              (crop (unwrap-panic crop-opt))
+              (farmer-opt (map-get? farmers (get farmer-id crop)))
+              (platform-fee (/ (* (get total-price order) (var-get platform-fee-rate)) u10000))
+              (farmer-payment (- (get total-price order) platform-fee))
+            )
+            (begin
+              (asserts! (is-some farmer-opt) ERR_NOT_FOUND)
+
+              (let
+                (
+                  (farmer (unwrap-panic farmer-opt))
+                  (current-escrow (default-to u0 (map-get? escrow-balances tx-sender)))
+                )
+                (begin
+                  ;; Check escrow balance
+                  (asserts! (>= current-escrow (get escrow-amount order)) ERR_INSUFFICIENT_BALANCE)
+
+                  ;; Transfer payment to farmer
+                  (try! (as-contract (stx-transfer? farmer-payment tx-sender (get owner farmer))))
+
+                  ;; Transfer platform fee to contract owner
+                  (try! (as-contract (stx-transfer? platform-fee tx-sender CONTRACT_OWNER)))
+
+                  ;; Update escrow balance
+                  (map-set escrow-balances tx-sender (- current-escrow (get escrow-amount order)))
+
+                  ;; Update order status
+                  (map-set purchase-orders order-id (merge order { status: ORDER_STATUS_COMPLETED }))
+
+                  ;; Update crop status and quantity
+                  (if (is-eq (get quantity order) (get quantity crop))
+                    ;; Entire crop sold
+                    (map-set crops (get crop-id order) (merge crop {
+                      status: CROP_STATUS_SOLD,
+                      quantity: u0
+                    }))
+                    ;; Partial sale
+                    (map-set crops (get crop-id order) (merge crop {
+                      status: CROP_STATUS_AVAILABLE,
+                      quantity: (- (get quantity crop) (get quantity order))
+                    }))
+                  )
+
+                  ;; Update farmer stats
+                  (map-set farmers (get farmer-id crop) (merge farmer {
+                    total-crops-sold: (+ (get total-crops-sold farmer) u1),
+                    reputation-score: (+ (get reputation-score farmer) u10) ;; Increase reputation
+                  }))
+
+                  (ok order-id)
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+;; Cancel purchase order
+(define-public (cancel-purchase-order (order-id uint))
+  (let
+    (
+      (order-opt (map-get? purchase-orders order-id))
+    )
+    (begin
+      (asserts! (is-contract-active) ERR_UNAUTHORIZED)
+      (asserts! (is-some order-opt) ERR_NOT_FOUND)
+
+      (let
+        (
+          (order (unwrap-panic order-opt))
+          (crop-opt (map-get? crops (get crop-id order)))
+        )
+        (begin
+          (asserts! (is-some crop-opt) ERR_NOT_FOUND)
+
+          (let
+            (
+              (crop (unwrap-panic crop-opt))
+              (farmer-opt (map-get? farmers (get farmer-id crop)))
+              (is-buyer (is-eq tx-sender (get buyer order)))
+              (is-farmer (and (is-some farmer-opt)
+                             (is-eq tx-sender (get owner (unwrap-panic farmer-opt)))))
+            )
+            (begin
+              ;; Check caller is buyer or farmer
+              (asserts! (or is-buyer is-farmer) ERR_UNAUTHORIZED)
+              ;; Check order is pending or confirmed
+              (asserts! (or (is-eq (get status order) ORDER_STATUS_PENDING)
+                           (is-eq (get status order) ORDER_STATUS_CONFIRMED)) ERR_INVALID_AMOUNT)
+
+              (let
+                (
+                  (current-escrow (default-to u0 (map-get? escrow-balances (get buyer order))))
+                )
+                (begin
+                  ;; Refund escrow to buyer
+                  (if (> current-escrow u0)
+                    (begin
+                      (try! (as-contract (stx-transfer? (get escrow-amount order) tx-sender (get buyer order))))
+                      (map-set escrow-balances (get buyer order) (- current-escrow (get escrow-amount order)))
+                    )
+                    true
+                  )
+
+                  ;; Update order status
+                  (map-set purchase-orders order-id (merge order { status: ORDER_STATUS_CANCELLED }))
+
+                  ;; Release crop reservation if it was reserved
+                  (if (is-eq (get status crop) CROP_STATUS_RESERVED)
+                    (map-set crops (get crop-id order) (merge crop { status: CROP_STATUS_AVAILABLE }))
+                    true
+                  )
+
+                  (ok order-id)
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+;; ===========================================
+;; READ-ONLY FUNCTIONS - MARKETPLACE
+;; ===========================================
+
+;; Get purchase order information
+(define-read-only (get-purchase-order (order-id uint))
+  (map-get? purchase-orders order-id)
+)
+
+;; Get buyer's escrow balance
+(define-read-only (get-escrow-balance (buyer principal))
+  (default-to u0 (map-get? escrow-balances buyer))
+)
+
+;; Calculate platform fee for an amount
+(define-read-only (calculate-platform-fee (amount uint))
+  (/ (* amount (var-get platform-fee-rate)) u10000)
+)
+
+;; Get next order ID
+(define-read-only (get-next-order-id)
+  (var-get next-order-id)
+)
+
+;; Check if crop is available for purchase
+(define-read-only (is-crop-available (crop-id uint))
+  (match (map-get? crops crop-id)
+    crop (and
+           (is-eq (get status crop) CROP_STATUS_AVAILABLE)
+           (> (get expiry-date crop) block-height)
+           (> (get quantity crop) u0))
+    false
+  )
+)
+
+;; Get marketplace summary
+(define-read-only (get-marketplace-summary)
+  {
+    total-orders: (- (var-get next-order-id) u1),
+    platform-fee-rate: (var-get platform-fee-rate),
+    contract-active: (var-get contract-active)
+  }
+)
